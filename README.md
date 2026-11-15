@@ -1,3 +1,5 @@
+[![windows]](README-windows.md)  ·  Windows 版（TSF 输入法 + 托盘 + 安装器）：见 [README-windows.md](README-windows.md)
+
 <div align="center">
 
 <img src="icons/hicolor/scalable/apps/wowtype.svg" width="112" alt="WowType 图标">

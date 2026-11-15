@@ -78,18 +78,30 @@ fn find_server(
 /// 设置界面「下载」放 llama-server 的地方：`$XDG_DATA_HOME/wowtype/llama/llama-server`
 /// （llama.cpp 官方发布的二进制，和它的动态库在同一个目录）。
 pub fn downloaded_server() -> Option<PathBuf> {
+    #[cfg(unix)]
     let data = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
     };
+    #[cfg(windows)]
+    let data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)?
+        .join("wowtype");
     Some(data.join("wowtype/llama/llama-server"))
 }
 
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        path.metadata().map(|m| m.is_file()).unwrap_or(false)
+    }
 }
 
 struct Running {

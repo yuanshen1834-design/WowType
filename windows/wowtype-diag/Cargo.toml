@@ -1,0 +1,22 @@
+[package]
+name = "wowtype-diag"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "WowTypeDiag"
+path = "src/main.rs"
+
+[dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_TextServices",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"

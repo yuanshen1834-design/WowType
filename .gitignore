@@ -55,3 +55,12 @@ swbd*.bin
 decgnr.bin
 mpd_e2e.bin
 nlrgpt2_nnlm.bin
+
+# WowType Windows: build artifacts
+windows/*/target/
+dist/
+payload/
+app/
+*.exe
+*.dll
+*.ico
