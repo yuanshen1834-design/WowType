@@ -1,0 +1,10 @@
+[Addon]
+Name=Windows UI
+Type=SharedLibrary
+Library=winui
+Category=UI
+Version=@PROJECT_VERSION@
+OnDemand=True
+
+[Addon/Dependencies]
+0=core

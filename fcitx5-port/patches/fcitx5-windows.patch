@@ -1,0 +1,1317 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 30ed71f..89aabb0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,11 @@ set(CMAKE_INSTALL_PREFIX C:)
+ set(ENV{PKG_CONFIG_PATH} "${CMAKE_SYSROOT}/lib/pkgconfig")
+ # For std::osyncstream
+ add_compile_options(-fexperimental-library)
++# Windows 移植补丁：新版 mingw-w64 头文件把 clockid_t 挪进了 pthread_compat.h，
++# fcitx5 的 eventloopinterface.h 直接用了它。强制包含一次即可（有 include guard）。
++if(WIN32)
++    add_compile_options(-include pthread_compat.h)
++endif()
+ 
+ add_subdirectory(fcitx5)
+ target_compile_definitions(Fcitx5Utils PUBLIC -DFcitx5Utils_EXPORTS)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4eb2fe5..0cd3e07 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1,4 +1,6 @@
+-add_executable(Fcitx5 main.cpp)
+-target_link_libraries(Fcitx5 Fcitx5::Core)
++# fcitx5 主程序（服务进程，加载 addon 的引擎）
++add_executable(fcitx5 main.cpp)
++target_link_libraries(fcitx5 PRIVATE Fcitx5::Core Fcitx5::Utils)
+ 
+-install(TARGETS Fcitx5 DESTINATION "${FCITX_INSTALL_BINDIR}")
++# WowType Windows 移植：WinUI 候选窗 addon
++add_subdirectory(winui)
+diff --git a/src/winui/CMakeLists.txt b/src/winui/CMakeLists.txt
+new file mode 100644
+index 0000000..27af935
+--- /dev/null
++++ b/src/winui/CMakeLists.txt
+@@ -0,0 +1,12 @@
++# WowType Windows 移植：WinUI 候选窗 addon
++add_library(winui MODULE winui.cpp)
++target_include_directories(winui PRIVATE)
++target_link_libraries(winui PRIVATE Fcitx5::Core Fcitx5::Utils user32 gdi32)
++set_target_properties(winui PROPERTIES PREFIX "" OUTPUT_NAME "winui")
++
++configure_file(winui.conf.in
++    "${CMAKE_CURRENT_BINARY_DIR}/winui.conf" @ONLY)
++
++install(TARGETS winui LIBRARY DESTINATION "${FCITX_INSTALL_ADDONDIR}")
++install(FILES "${CMAKE_CURRENT_BINARY_DIR}/winui.conf"
++    DESTINATION "${FCITX_INSTALL_PKGDATADIR}/addon")
+diff --git a/src/winui/winui.conf.in b/src/winui/winui.conf.in
+new file mode 100644
+index 0000000..881c85f
+--- /dev/null
++++ b/src/winui/winui.conf.in
+@@ -0,0 +1,10 @@
++[Addon]
++Name=Windows UI
++Type=SharedLibrary
++Library=winui
++Category=UI
++Version=@PROJECT_VERSION@
++OnDemand=True
++
++[Addon/Dependencies]
++0=core
+diff --git a/src/winui/winui.cpp b/src/winui/winui.cpp
+new file mode 100644
+index 0000000..10f6f2b
+--- /dev/null
++++ b/src/winui/winui.cpp
+@@ -0,0 +1,347 @@
++/*
++ * WowType Windows 移植：WinUI addon 实现。
++ * 候选窗：WS_POPUP + TOPMOST 无激活窗口，GDI 自绘。
++ * 数据来源：fcitx::InputPanel（引擎/TSF 写入），update() 时重绘。
++ */
++#include "winui.h"
++
++#include <windows.h>
++#include <windowsx.h>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include <fcitx/candidatelist.h>
++#include <fcitx/inputpanel.h>
++#include <fcitx/instance.h>
++#include <fcitx/statusarea.h>
++#include <fcitx/text.h>
++#include <fcitx/userinterfacemanager.h>
++#include <fcitx-utils/i18n.h>
++#include <fcitx/addonfactory.h>
++#include <fcitx/addonmanager.h>
++
++namespace fcitx {
++
++namespace {
++
++constexpr const wchar_t *kWindowClass = L"WowTypeWinUiCandidate";
++constexpr int kFontSize = 20;
++constexpr int kPreeditFontSize = 16;
++constexpr int kPaddingX = 10;
++constexpr int kPaddingY = 6;
++constexpr int kItemGap = 8;
++constexpr int kItemHeight = 26;
++constexpr int kPreeditHeight = 24;
++
++struct PanelSnapshot {
++    std::string preedit;
++    std::vector<std::string> candidates;
++    int cursor = -1;
++    int pageSize = 0;
++    bool horizontal = true;
++    bool hasPrev = false;
++    bool hasNext = false;
++    bool empty() const { return preedit.empty() && candidates.empty(); }
++};
++
++std::wstring toWide(const std::string &s) {
++    if (s.empty()) {
++        return {};
++    }
++    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
++    std::wstring out(len, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), len);
++    return out;
++}
++
++// 收集面板数据（在 update() 里调用，把所有要画的东西拷成快照）
++PanelSnapshot snapshotPanel(InputContext *ic) {
++    PanelSnapshot snap;
++    auto &panel = ic->inputPanel();
++    snap.preedit = panel.preedit().toString();
++    if (auto list = panel.candidateList()) {
++        snap.cursor = list->cursorIndex();
++        snap.pageSize = list->size();
++        snap.horizontal = list->layoutHint() == CandidateLayoutHint::Horizontal;
++        const int n = list->size();
++        for (int i = 0; i < n; ++i) {
++            snap.candidates.push_back(list->candidate(i).text().toString());
++        }
++        if (auto *pageable = dynamic_cast<PageableCandidateList *>(list.get())) {
++            snap.hasPrev = pageable->hasPrev();
++            snap.hasNext = pageable->hasNext();
++        }
++    }
++    return snap;
++}
++
++// GDI 文本宽度
++int textWidth(HDC hdc, const std::wstring &text, int fontSize, HFONT font) {
++    HGDIOBJ old = SelectObject(hdc, font);
++    SIZE size{};
++    GetTextExtentPoint32W(hdc, text.data(), (int)text.size(), &size);
++    SelectObject(hdc, old);
++    return size.cx;
++}
++
++struct WinWindow {
++    HWND hwnd = nullptr;
++    PanelSnapshot snap;
++    HFONT font = nullptr;
++    HFONT preeditFont = nullptr;
++    HFONT hintFont = nullptr;
++    POINT pos{0, 0};
++
++    ~WinWindow() {
++        if (hwnd) {
++            DestroyWindow(hwnd);
++        }
++        if (font) DeleteObject(font);
++        if (preeditFont) DeleteObject(preeditFont);
++        if (hintFont) DeleteObject(hintFont);
++    }
++
++    void create() {
++        HINSTANCE hinst = GetModuleHandleW(nullptr);
++        WNDCLASSW wc{};
++        wc.lpfnWndProc = WinWindow::wndProc;
++        wc.hInstance = hinst;
++        wc.lpszClassName = kWindowClass;
++        wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
++        RegisterClassW(&wc);
++        hwnd = CreateWindowExW(
++            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kWindowClass,
++            L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hinst, this);
++        font = CreateFontW(-kFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
++                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
++                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
++                           DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
++        preeditFont =
++            CreateFontW(-kPreeditFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
++                        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
++                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
++                        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
++        hintFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
++                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
++                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
++                               DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
++    }
++
++    void layout() {
++        if (!hwnd) {
++            return;
++        }
++        HDC hdc = GetDC(hwnd);
++        int width = 80;
++        if (!snap.preedit.empty()) {
++            width = std::max(width, textWidth(hdc, toWide(snap.preedit),
++                                              kPreeditFontSize, preeditFont) +
++                                        kPaddingX * 2);
++        }
++        if (snap.horizontal) {
++            int total = kPaddingX * 2;
++            for (size_t i = 0; i < snap.candidates.size(); ++i) {
++                total += textWidth(hdc, toWide(std::to_string(i + 1) + "." +
++                                               snap.candidates[i]),
++                                   kFontSize, font) +
++                         kItemGap;
++            }
++            if (!snap.candidates.empty()) {
++                total -= kItemGap;
++            }
++            width = std::max(width, total);
++        } else {
++            int maxItem = 0;
++            for (size_t i = 0; i < snap.candidates.size(); ++i) {
++                maxItem = std::max(
++                    maxItem,
++                    textWidth(hdc, toWide(std::to_string(i + 1) + "." +
++                                          snap.candidates[i]),
++                              kFontSize, font));
++            }
++            width = std::max(width, maxItem + kPaddingX * 2);
++        }
++        int height = kPaddingY * 2;
++        if (!snap.preedit.empty()) {
++            height += kPreeditHeight;
++        }
++        if (!snap.candidates.empty()) {
++            height += snap.horizontal
++                          ? kItemHeight
++                          : kItemHeight * (int)snap.candidates.size();
++        }
++        if (snap.hasPrev || snap.hasNext) {
++            height += 16;
++        }
++        ReleaseDC(hwnd, hdc);
++
++        // 屏幕内夹紧
++        RECT work{};
++        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
++        int x = std::clamp<int>(pos.x, (int)work.left, std::max<int>((int)work.left, (int)work.right - width));
++        int y = std::clamp<int>(pos.y, (int)work.top, std::max<int>((int)work.top, (int)work.bottom - height));
++        SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height,
++                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
++        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
++        InvalidateRect(hwnd, nullptr, TRUE);
++    }
++
++    void paint() {
++        PAINTSTRUCT ps{};
++        HDC hdc = BeginPaint(hwnd, &ps);
++        RECT rc{};
++        GetClientRect(hwnd, &rc);
++
++        HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
++        FillRect(hdc, &rc, bg);
++        DeleteObject(bg);
++
++        HPEN pen = CreatePen(PS_SOLID, 1, RGB(190, 180, 170));
++        HGDIOBJ oldPen = SelectObject(hdc, pen);
++        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
++        SelectObject(hdc, oldPen);
++        DeleteObject(pen);
++
++        SetBkMode(hdc, TRANSPARENT);
++        int y = kPaddingY;
++        if (!snap.preedit.empty()) {
++            SelectObject(hdc, preeditFont);
++            SetTextColor(hdc, RGB(110, 110, 110));
++            auto w = toWide(snap.preedit);
++            TextOutW(hdc, kPaddingX, y, w.data(), (int)w.size());
++            y += kPreeditHeight;
++        }
++        if (!snap.candidates.empty()) {
++            SelectObject(hdc, font);
++            if (snap.horizontal) {
++                int x = kPaddingX;
++                for (size_t i = 0; i < snap.candidates.size(); ++i) {
++                    auto label = toWide(std::to_string(i + 1) + "." +
++                                        snap.candidates[i]);
++                    if ((int)i == snap.cursor) {
++                        HBRUSH hl = CreateSolidBrush(RGB(255, 232, 208));
++                        RECT hr{x - 3, y - 2, x + textWidth(hdc, label, kFontSize, font) + 3,
++                                y + kItemHeight};
++                        FillRect(hdc, &hr, hl);
++                        DeleteObject(hl);
++                    }
++                    SetTextColor(hdc, RGB(32, 32, 32));
++                    TextOutW(hdc, x, y, label.data(), (int)label.size());
++                    x += textWidth(hdc, label, kFontSize, font) + kItemGap;
++                }
++                y += kItemHeight;
++            } else {
++                for (size_t i = 0; i < snap.candidates.size(); ++i) {
++                    auto label = toWide(std::to_string(i + 1) + "." +
++                                        snap.candidates[i]);
++                    if ((int)i == snap.cursor) {
++                        HBRUSH hl = CreateSolidBrush(RGB(255, 232, 208));
++                        RECT hr{kPaddingX - 3, y - 2,
++                                kPaddingX + textWidth(hdc, label, kFontSize, font) + 3,
++                                y + kItemHeight};
++                        FillRect(hdc, &hr, hl);
++                        DeleteObject(hl);
++                    }
++                    SetTextColor(hdc, RGB(32, 32, 32));
++                    TextOutW(hdc, kPaddingX, y, label.data(), (int)label.size());
++                    y += kItemHeight;
++                }
++            }
++        }
++        if (snap.hasPrev || snap.hasNext) {
++            SelectObject(hdc, hintFont);
++            SetTextColor(hdc, RGB(140, 140, 140));
++            const wchar_t *hint = L"- = 翻页";
++            TextOutW(hdc, kPaddingX, y, hint, (int)wcslen(hint));
++        }
++        EndPaint(hwnd, &ps);
++    }
++
++    void hide() {
++        if (hwnd) {
++            ShowWindow(hwnd, SW_HIDE);
++        }
++    }
++
++    static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam,
++                                    LPARAM lParam) {
++        WinWindow *self = nullptr;
++        if (msg == WM_NCCREATE) {
++            auto *cs = reinterpret_cast<CREATESTRUCTW *>(lParam);
++            self = static_cast<WinWindow *>(cs->lpCreateParams);
++            SetWindowLongPtrW(hwnd, GWLP_USERDATA,
++                              reinterpret_cast<LONG_PTR>(self));
++            self->hwnd = hwnd;
++        } else {
++            self = reinterpret_cast<WinWindow *>(
++                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
++        }
++        if (!self) {
++            return DefWindowProcW(hwnd, msg, wParam, lParam);
++        }
++        switch (msg) {
++        case WM_PAINT:
++            self->paint();
++            return 0;
++        case WM_MOUSEACTIVATE:
++            return MA_NOACTIVATE;
++        default:
++            return DefWindowProcW(hwnd, msg, wParam, lParam);
++        }
++    }
++};
++
++class WinUiFactory;
++
++} // namespace
++
++WinUi::WinUi(Instance *instance) : instance_(instance) {
++    auto *win = new WinWindow();
++    win->create();
++    win_ = win;
++}
++
++WinUi::~WinUi() { delete static_cast<WinWindow *>(win_); }
++
++void WinUi::update(UserInterfaceComponent component, InputContext *ic) {
++    if (component != UserInterfaceComponent::InputPanel || suspended_) {
++        return;
++    }
++    showPanel(ic);
++}
++
++bool WinUi::available() { return true; }
++
++void WinUi::suspend() {
++    suspended_ = true;
++    hidePanel();
++}
++
++void WinUi::resume() { suspended_ = false; }
++
++void WinUi::showPanel(InputContext *ic) {
++    auto *win = static_cast<WinWindow *>(win_);
++    win->snap = snapshotPanel(ic);
++    if (win->snap.empty()) {
++        win->hide();
++        return;
++    }
++    win->pos.x = ic->cursorRect().left();
++    win->pos.y = ic->cursorRect().top();
++    win->layout();
++}
++
++void WinUi::hidePanel() { static_cast<WinWindow *>(win_)->hide(); }
++
++class WinUiFactory : public AddonFactory {
++public:
++    AddonInstance *create(AddonManager *manager) override {
++        return new WinUi(manager->instance());
++    }
++};
++
++} // namespace fcitx
++
++FCITX_ADDON_FACTORY_V2(winui, fcitx::WinUiFactory);
+diff --git a/src/winui/winui.h b/src/winui/winui.h
+new file mode 100644
+index 0000000..2ed7256
+--- /dev/null
++++ b/src/winui/winui.h
+@@ -0,0 +1,46 @@
++/*
++ * WowType Windows 移植：WinUI addon —— fcitx5 的 Windows 候选窗显示层。
++ *
++ * fcitx5 在 Windows 上没有任何 UI addon（classicui 依赖 X11、kimpanel 依赖 DBus），
++ * 这个 addon 补上最小的一块：读 InputPanel（拼音 + 候选 + 翻页），
++ * 用 Win32 GDI 画一个无激活的置顶候选窗。
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#ifndef _WINUI_H_
++#define _WINUI_H_
++
++#include <fcitx/addoninstance.h>
++#include <fcitx/userinterface.h>
++
++namespace fcitx {
++
++class Instance;
++
++class WinUi final : public UserInterface {
++public:
++    WinUi(Instance *instance);
++    ~WinUi() override;
++
++    Instance *instance() const { return instance_; }
++
++    // UserInterface
++    void update(UserInterfaceComponent component,
++                InputContext *inputContext) override;
++    bool available() override;
++    void suspend() override;
++    void resume() override;
++
++    // 窗口管理（TSF 层也可直接调用 show/hide）
++    void showPanel(InputContext *ic);
++    void hidePanel();
++
++private:
++    Instance *instance_;
++    void *win_; // WinWindow 实现细节（避免在头文件暴露 windows.h）
++    bool suspended_ = false;
++};
++
++} // namespace fcitx
++
++#endif // _WINUI_H_
+diff --git a/win32/CMakeLists.txt b/win32/CMakeLists.txt
+index d65dfcb..71f7237 100644
+--- a/win32/CMakeLists.txt
++++ b/win32/CMakeLists.txt
+@@ -9,7 +9,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ 
+-add_subdirectory(assets)
++# 缺 ImageMagick 时生成 ico 失败；dll 不依赖它
++# add_subdirectory(assets)
+ add_subdirectory(tsf)
+ add_subdirectory(dll)
+ 
+diff --git a/win32/dll/register.cpp b/win32/dll/register.cpp
+index 4601938..f88dee9 100644
+--- a/win32/dll/register.cpp
++++ b/win32/dll/register.cpp
+@@ -1,6 +1,6 @@
+ #include "register.h"
+ #include "util.h"
+-#include <atlcomcli.h>
++#include "../tsf/atlcomcli_min.h"
+ #include <filesystem>
+ #include <msctf.h>
+ 
+@@ -77,6 +77,8 @@ BOOL RegisterProfiles() {
+ }
+ 
+ // No documentation about what they means.
++// 能力类别注册（mingw 的 msctf.h 缺属性类 GUID，那些对键盘输入非必需，
++// 这里只注册键盘 TIP 需要的核心类别）
+ const GUID Categories[] = {GUID_TFCAT_CATEGORY_OF_TIP,
+                            GUID_TFCAT_TIP_KEYBOARD,
+                            GUID_TFCAT_TIPCAP_SECUREMODE,
+@@ -86,13 +88,9 @@ const GUID Categories[] = {GUID_TFCAT_CATEGORY_OF_TIP,
+                            GUID_TFCAT_TIPCAP_WOW16,
+                            GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+                            GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+-                           GUID_TFCAT_PROP_AUDIODATA,
+-                           GUID_TFCAT_PROP_INKDATA,
+-                           GUID_TFCAT_PROPSTYLE_CUSTOM,
+-                           GUID_TFCAT_PROPSTYLE_STATIC,
+-                           GUID_TFCAT_PROPSTYLE_STATICCOMPACT,
+                            GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+-                           GUID_TFCAT_DISPLAYATTRIBUTEPROPERTY};
++                           GUID_TFCAT_DISPLAYATTRIBUTEPROPERTY,
++                           GUID_NULL};
+ 
+ /*
+ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\CTF\TIP\{FC3869BA-51E3-4078-8EE2-5FE49493A1F4}
+@@ -111,8 +109,9 @@ BOOL RegisterCategories() {
+     CoCreateInstance(CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
+                      IID_ITfCategoryMgr, reinterpret_cast<void **>(&mgr));
+     HRESULT hr = S_OK;
+-    for (const auto &guid : Categories) {
+-        hr |= mgr->RegisterCategory(FCITX_CLSID, guid, FCITX_CLSID);
++    // 用指针循环（clang 23 对 extern 的 C 数组不支持 range-for）
++    for (const GUID *guid = Categories; *guid != GUID_NULL; ++guid) {
++        hr |= mgr->RegisterCategory(FCITX_CLSID, *guid, FCITX_CLSID);
+     }
+     mgr->Release();
+     return hr == S_OK;
+diff --git a/win32/tsf/CMakeLists.txt b/win32/tsf/CMakeLists.txt
+index 5f4c3fc..cb980fd 100644
+--- a/win32/tsf/CMakeLists.txt
++++ b/win32/tsf/CMakeLists.txt
+@@ -1,3 +1,7 @@
++# WowType Windows 移植：链接 fcitx5 库（fcitx5-inst 安装目录提供 cmake 配置）
++find_package(Fcitx5Core 5.0 REQUIRED)
++find_package(Fcitx5Utils 5.0 REQUIRED)
++
+ add_library(tsf STATIC
+     tsf.cpp
+     TextInputProcessorEx.cpp
+@@ -6,4 +10,9 @@ add_library(tsf STATIC
+     KeyEventSink.cpp
+     EditSession.cpp
+     CompositionSink.cpp
++    fcitx_bridge.cpp
+ )
++
++# EventLoop 的完整定义在 fcitx-utils/event.h（公开头），无需额外路径。
++
++target_link_libraries(tsf PUBLIC Fcitx5::Core Fcitx5::Utils)
+diff --git a/win32/tsf/EditSession.cpp b/win32/tsf/EditSession.cpp
+index 862a87c..b1dcca1 100644
+--- a/win32/tsf/EditSession.cpp
++++ b/win32/tsf/EditSession.cpp
+@@ -2,6 +2,15 @@
+ 
+ namespace fcitx {
+ STDMETHODIMP Tsf::DoEditSession(TfEditCookie ec) {
++    // 上屏引擎排队的 commit（fcitx 事件循环线程写入，这里在 UI 线程执行）
++    std::wstring text;
++    {
++        std::lock_guard<std::mutex> lk(commitMutex_);
++        if (pendingCommit_.empty()) {
++            return S_OK;
++        }
++        text.swap(pendingCommit_);
++    }
+     CComPtr<ITfInsertAtSelection> insertAtSelection;
+     if (textEditSinkContext_->QueryInterface(
+             IID_ITfInsertAtSelection, (LPVOID *)&insertAtSelection) != S_OK) {
+@@ -12,22 +21,14 @@ STDMETHODIMP Tsf::DoEditSession(TfEditCookie ec) {
+                                                  0, &range) != S_OK) {
+         return E_FAIL;
+     }
+-    CComPtr<ITfContextComposition> contextComposition;
+-    if (textEditSinkContext_->QueryInterface(
+-            IID_ITfContextComposition, (void **)&contextComposition) != S_OK) {
+-        return E_FAIL;
+-    }
+-    CComPtr<ITfComposition> composition;
+-    if (contextComposition->StartComposition(ec, range, this, &composition) !=
+-            S_OK ||
+-        composition == nullptr) {
+-        return E_FAIL;
+-    }
+-
+-    range->SetText(ec, 0, L"哈", 1);
+-
+-    composition->EndComposition(ec);
+-
++    // 文字插入到选区开头，选区移到末尾
++    range->SetText(ec, 0, text.c_str(), (LONG)text.size());
++    range->Collapse(ec, TF_ANCHOR_END);
++    TF_SELECTION selection{};
++    selection.range = range;
++    selection.style.ase = TF_AE_END;
++    selection.style.fInterimChar = FALSE;
++    textEditSinkContext_->SetSelection(ec, 1, &selection);
+     return S_OK;
+ }
+ } // namespace fcitx
+diff --git a/win32/tsf/KeyEventSink.cpp b/win32/tsf/KeyEventSink.cpp
+index 9e7f523..6a7256f 100644
+--- a/win32/tsf/KeyEventSink.cpp
++++ b/win32/tsf/KeyEventSink.cpp
+@@ -1,4 +1,5 @@
+ #include "tsf.h"
++#include "fcitx_bridge.h"
+ 
+ namespace fcitx {
+ bool Tsf::initKeyEventSink() {
+@@ -18,48 +19,70 @@ void Tsf::uninitKeyEventSink() {
+     keystrokeMgr->UnadviseKeyEventSink(clientId_);
+ }
+ 
+-BOOL Tsf::processKey(WPARAM wParam, LPARAM lParam) {
+-    HRESULT phrSession;
+-    textEditSinkContext_->RequestEditSession(
+-        clientId_, this, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &phrSession);
+-    return TRUE;
++STDMETHODIMP Tsf::OnSetFocus(BOOL fForeground) {
++    if (engineReady() && bridge_ && bridge_->ic) {
++        bridge_->runOnLoop([&]() {
++            if (fForeground) {
++                bridge_->ic->focusIn();
++            } else {
++                bridge_->ic->focusOut();
++            }
++        });
++    }
++    return S_OK;
+ }
+ 
+-STDMETHODIMP Tsf::OnSetFocus(BOOL fForeground) { return S_OK; }
+-
+ STDMETHODIMP Tsf::OnTestKeyDown(ITfContext *pContext, WPARAM wParam,
+                                 LPARAM lParam, BOOL *pfEaten) {
++    // 拼音编辑中才吃键：简单策略——有候选/预编辑时吃可打印键和编辑键，
++    // 否则放行给应用（TSF 语义：OnTestKeyDown 为 TRUE 的键不再给应用）。
+     if (keyDownHandled_) {
+         *pfEaten = TRUE;
+-    } else {
+-        *pfEaten = keyDownHandled_ = processKey(wParam, lParam);
++        return S_OK;
+     }
++    ensureEngine();
++    *pfEaten = FALSE;
++    const UINT vk = (UINT)wParam;
++    // 引擎就绪后：字母/数字/标点/空格/退格/回车等交给 fcitx 判定。
++    // 引擎会处理中文模式下的按键；英文模式（或引擎放行）时我们也不该吞键，
++    // 所以这里保守：只吃"引擎当前有预编辑内容"时的编辑键，其余交给
++    // OnKeyDown 的结果回填（TSF 允许 OnTestKeyDown FALSE、OnKeyDown TRUE）。
+     return S_OK;
+ }
+ 
+ STDMETHODIMP Tsf::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam,
+                             BOOL *pfEaten) {
+-    if (keyDownHandled_) {
+-        keyDownHandled_ = FALSE;
+-        *pfEaten = TRUE;
+-    } else {
+-        *pfEaten = keyDownHandled_ = processKey(wParam, lParam);
+-    }
++    ensureEngine();
++    updateCursorRect(pContext);
++    const UINT vk = (UINT)wParam;
++    bool handled = forwardKeyToFcitx(vk, false);
++    keyDownHandled_ = handled;
++    *pfEaten = handled ? TRUE : FALSE;
+     return S_OK;
+ }
+ 
+ STDMETHODIMP Tsf::OnTestKeyUp(ITfContext *pContext, WPARAM wParam,
+                               LPARAM lParam, BOOL *pfEaten) {
++    *pfEaten = FALSE;
+     return S_OK;
+ }
+ 
+ STDMETHODIMP Tsf::OnKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam,
+                           BOOL *pfEaten) {
++    if (!engineReady()) {
++        *pfEaten = FALSE;
++        return S_OK;
++    }
++    const UINT vk = (UINT)wParam;
++    // Shift 等修饰键的松开也要给引擎（中英切换靠单按 Shift）
++    bool handled = forwardKeyToFcitx(vk, true);
++    *pfEaten = handled ? TRUE : FALSE;
+     return S_OK;
+ }
+ 
+ STDMETHODIMP Tsf::OnPreservedKey(ITfContext *pContext, REFGUID rguid,
+                                  BOOL *pfEaten) {
++    *pfEaten = FALSE;
+     return S_OK;
+ }
+ } // namespace fcitx
+diff --git a/win32/tsf/TextInputProcessorEx.cpp b/win32/tsf/TextInputProcessorEx.cpp
+index 0ef7100..ff14cdd 100644
+--- a/win32/tsf/TextInputProcessorEx.cpp
++++ b/win32/tsf/TextInputProcessorEx.cpp
+@@ -6,6 +6,7 @@ STDAPI Tsf::Activate(ITfThreadMgr *pThreadMgr, TfClientId tfClientId) {
+ }
+ 
+ STDAPI Tsf::Deactivate() {
++    destroyEngine();
+     initTextEditSink(CComPtr<ITfDocumentMgr>());
+     uninitThreadMgrEventSink();
+     uninitKeyEventSink();
+@@ -32,6 +33,9 @@ STDAPI Tsf::ActivateEx(ITfThreadMgr *pThreadMgr, TfClientId tfClientId,
+         goto ActivateExError;
+     }
+ 
++    // fcitx5 引擎（词库/候选/上屏全在这里面）
++    ensureEngine();
++
+     return S_OK;
+ 
+ ActivateExError:
+diff --git a/win32/tsf/ThreadMgrEventSink.cpp b/win32/tsf/ThreadMgrEventSink.cpp
+index e30b12b..ad6ca3d 100644
+--- a/win32/tsf/ThreadMgrEventSink.cpp
++++ b/win32/tsf/ThreadMgrEventSink.cpp
+@@ -1,4 +1,5 @@
+ #include "tsf.h"
++#include "fcitx_bridge.h"
+ 
+ namespace fcitx {
+ bool Tsf::initThreadMgrEventSink() {
+@@ -33,6 +34,18 @@ STDMETHODIMP Tsf::OnUninitDocumentMgr(ITfDocumentMgr *pDocMgr) { return S_OK; }
+ STDMETHODIMP Tsf::OnSetFocus(ITfDocumentMgr *pDocMgrFocus,
+                              ITfDocumentMgr *pDocMgrPrevFocus) {
+     initTextEditSink(pDocMgrFocus);
++    if (pDocMgrFocus) {
++        CComPtr<ITfContext> context;
++        if (SUCCEEDED(pDocMgrFocus->GetTop(&context)) && context) {
++            updateCursorRect(context);
++        }
++        // 焦点进入：fcitx IC focusIn
++        if (engineReady() && bridge_ && bridge_->ic) {
++            bridge_->runOnLoop([&]() { bridge_->ic->focusIn(); });
++        }
++    } else if (engineReady() && bridge_ && bridge_->ic) {
++        bridge_->runOnLoop([&]() { bridge_->ic->focusOut(); });
++    }
+     return S_OK;
+ }
+ 
+diff --git a/win32/tsf/atlcomcli_min.h b/win32/tsf/atlcomcli_min.h
+new file mode 100644
+index 0000000..7ca5fd2
+--- /dev/null
++++ b/win32/tsf/atlcomcli_min.h
+@@ -0,0 +1,166 @@
++/*
++ * 最小 ATL 兼容层：只提供 fcitx5-windows 用到的 CComPtr / CComQIPtr。
++ * MSYS2 clang64 没有 ATL（MSVC 专有），这里按相同语义实现子集。
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#pragma once
++
++#include <msctf.h>
++#include <unknwn.h>
++
++// mingw 的 msctf.h 缺这些（老版本 SDK 头），按 Windows SDK 补：
++#ifndef TF_CLIENTID_NULL
++#define TF_CLIENTID_NULL 0xFFFFFFFF
++#endif
++
++// ITfTextInputProcessorEx：IID {6E4E2102-F9CD-433D-B496-303CE03A6507}
++#ifndef __ITfTextInputProcessorEx_INTERFACE_DEFINED__
++#define __ITfTextInputProcessorEx_INTERFACE_DEFINED__
++interface __declspec(uuid("6E4E2102-F9CD-433D-B496-303CE03A6507"))
++    ITfTextInputProcessorEx : public ITfTextInputProcessor {
++  public:
++    virtual HRESULT STDMETHODCALLTYPE ActivateEx(ITfThreadMgr *pThreadMgr,
++                                                 TfClientId tfClientId,
++                                                 DWORD dwFlags) = 0;
++};
++#endif
++
++// mingw msctf.h 缺的类别 GUID（值取自 Windows SDK / windows crate）。
++// 用 static const 直接带值，不依赖 uuid.lib 的符号。
++#ifndef GUID_TFCAT_CATEGORY_OF_TIP
++static const GUID GUID_TFCAT_CATEGORY_OF_TIP = {
++    0x534c48c1, 0x0607, 0x4098, {0xa5, 0x21, 0x4f, 0xc8, 0x99, 0xc7, 0x3e, 0x90}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_SECUREMODE
++static const GUID GUID_TFCAT_TIPCAP_SECUREMODE = {
++    0x49d2f9ce, 0x1f5e, 0x11d7, {0xa6, 0xd3, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_UIELEMENTENABLED
++static const GUID GUID_TFCAT_TIPCAP_UIELEMENTENABLED = {
++    0x49d2f9cf, 0x1f5e, 0x11d7, {0xa6, 0xd3, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT
++static const GUID GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT = {
++    0xccf05dd8, 0x4a87, 0x11d7, {0xa6, 0xe2, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_COMLESS
++static const GUID GUID_TFCAT_TIPCAP_COMLESS = {
++    0x364215d9, 0x75bc, 0x11d7, {0xa6, 0xef, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_WOW16
++static const GUID GUID_TFCAT_TIPCAP_WOW16 = {
++    0x364215da, 0x75bc, 0x11d7, {0xa6, 0xef, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT
++static const GUID GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT = {
++    0x13a016df, 0x560b, 0x46cd, {0x94, 0x7a, 0x4c, 0x3a, 0xf1, 0xe0, 0xe3, 0x5d}};
++#endif
++#ifndef GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT
++static const GUID GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT = {
++    0x25504fb4, 0x7bab, 0x4bc1, {0x9c, 0x69, 0xcf, 0x81, 0x89, 0x0f, 0x0e, 0xf5}};
++#endif
++
++namespace fcitx {
++
++template <typename T> class CComPtr {
++  public:
++    CComPtr() noexcept = default;
++    CComPtr(T *p) noexcept : p_(p) {}
++    CComPtr(const CComPtr &other) noexcept : p_(other.p_) {
++        if (p_) {
++            p_->AddRef();
++        }
++    }
++    CComPtr(CComPtr &&other) noexcept : p_(other.p_) { other.p_ = nullptr; }
++    ~CComPtr() {
++        if (p_) {
++            p_->Release();
++        }
++    }
++    CComPtr &operator=(const CComPtr &other) noexcept {
++        if (other.p_) {
++            other.p_->AddRef();
++        }
++        if (p_) {
++            p_->Release();
++        }
++        p_ = other.p_;
++        return *this;
++    }
++    CComPtr &operator=(T *other) noexcept {
++        if (other) {
++            other->AddRef();
++        }
++        if (p_) {
++            p_->Release();
++        }
++        p_ = other;
++        return *this;
++    }
++    T *operator->() const noexcept { return p_; }
++    operator T *() const noexcept { return p_; }
++    T **operator&() noexcept {
++        release();
++        return &p_;
++    }
++    T *get() const noexcept { return p_; }
++    T *Detach() noexcept {
++        T *p = p_;
++        p_ = nullptr;
++        return p;
++    }
++    void Attach(T *p) noexcept {
++        if (p_) {
++            p_->Release();
++        }
++        p_ = p;
++    }
++    void Release() noexcept {
++        if (p_) {
++            p_->Release();
++            p_ = nullptr;
++        }
++    }
++    void release() noexcept { Release(); }
++    explicit operator bool() const noexcept { return p_ != nullptr; }
++
++    // ATL 风格：ptr.CoCreateInstance(CLSID_xxx)
++    HRESULT CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter = nullptr,
++                             DWORD dwClsContext = CLSCTX_INPROC_SERVER,
++                             REFIID riid = __uuidof(T)) noexcept {
++        T *result = nullptr;
++        HRESULT hr = ::CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid,
++                                        reinterpret_cast<void **>(&result));
++        if (SUCCEEDED(hr) && result) {
++            Release();
++            p_ = result;
++        }
++        return hr;
++    }
++
++    // 常见用法：someInterface->QueryInterface(&ptr)
++    template <typename U> HRESULT QueryInterface(CComPtr<U> *pp) const noexcept {
++        if (!p_) {
++            return E_POINTER;
++        }
++        return p_->QueryInterface(__uuidof(U), reinterpret_cast<void **>(pp));
++    }
++
++  private:
++    T *p_ = nullptr;
++};
++
++template <typename T> using CComQIPtr = CComPtr<T>;
++
++} // namespace fcitx
++
++// ITfTextInputProcessorEx 的 IID（mingw 不生成；值来自 Windows SDK）
++#ifndef __IID_ITfTextInputProcessorEx_DEFINED__
++#define __IID_ITfTextInputProcessorEx_DEFINED__
++static const GUID IID_ITfTextInputProcessorEx = {
++    0x6e4e2102, 0xf9cd, 0x433d, {0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07}};
++#endif
++#ifndef GUID_TFCAT_DISPLAYATTRIBUTEPROPERTY
++static const GUID GUID_TFCAT_DISPLAYATTRIBUTEPROPERTY = {
++    0xb95f181b, 0xea4c, 0x4af1, {0x80, 0x56, 0x7c, 0x32, 0x1a, 0xbb, 0xb0, 0x91}};
++#endif
+\ No newline at end of file
+diff --git a/win32/tsf/fcitx_bridge.cpp b/win32/tsf/fcitx_bridge.cpp
+new file mode 100644
+index 0000000..6538f1f
+--- /dev/null
++++ b/win32/tsf/fcitx_bridge.cpp
+@@ -0,0 +1,239 @@
++/*
++ * WowType Windows 移植：TSF ↔ fcitx5 引擎桥实现。
++ * 结构定义在 fcitx_bridge.h；这里放引擎生命周期、按键转发、上屏。
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#include "tsf.h"
++#include "fcitx_bridge.h"
++#include "../dll/register.h"
++
++#include <fcitx/addonmanager.h>
++#include <fcitx/event.h>
++#include <fcitx/inputcontext.h>
++#include <fcitx/inputcontextmanager.h>
++#include <fcitx/instance.h>
++#include <fcitx-utils/eventdispatcher.h>
++#include <fcitx-utils/event.h>
++#include <fcitx-utils/keysym.h>
++#include <fcitx-utils/keysymgen.h>
++
++#include <filesystem>
++
++// dll/main.cpp 的引用计数（TSF DLL 生命周期）
++extern void DllAddRef();
++extern void DllRelease();
++
++namespace fcitx {
++
++namespace {
++
++// fcitx5 的数据/插件目录：DLL 的上级目录结构（与主程序 main.cpp 的 setupEnv 一致）
++void setupFcitxEnv(HMODULE dllModule) {
++    wchar_t path[MAX_PATH]{};
++    GetModuleFileNameW(dllModule, path, MAX_PATH);
++    std::filesystem::path dllPath(path);
++    auto rootPath = dllPath.parent_path().parent_path();
++    if (!GetEnvironmentVariableW(L"FCITX_ADDON_DIRS", nullptr, 0)) {
++        std::wstring addonDirs = (rootPath / L"lib" / L"fcitx5").wstring();
++        SetEnvironmentVariableW(L"FCITX_ADDON_DIRS", addonDirs.c_str());
++    }
++    if (!GetEnvironmentVariableW(L"XDG_DATA_DIRS", nullptr, 0)) {
++        std::wstring dataDirs = (rootPath / L"share").wstring();
++        SetEnvironmentVariableW(L"XDG_DATA_DIRS", dataDirs.c_str());
++    }
++    if (!GetEnvironmentVariableW(L"FCITX_DATA_DIRS", nullptr, 0)) {
++        std::wstring fcitxData = (rootPath / L"share" / L"fcitx5").wstring();
++        SetEnvironmentVariableW(L"FCITX_DATA_DIRS", fcitxData.c_str());
++    }
++}
++
++// 从 VK + 修饰键构造 fcitx::Key。
++Key keyFromVk(UINT vk, KeyStates states) {
++    KeySym sym = FcitxKey_None;
++    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
++    wchar_t buf[8]{};
++    BYTE kbd[256]{};
++    if (ToUnicode(vk, scan, kbd, buf, 8, 0) > 0) {
++        for (wchar_t *p = buf; *p; ++p) {
++            KeySym s = Key::keySymFromUnicode(*p);
++            if (s != FcitxKey_None) {
++                sym = s;
++                break;
++            }
++        }
++    }
++    if (sym == FcitxKey_None) {
++        switch (vk) {
++        case VK_BACK: sym = FcitxKey_BackSpace; break;
++        case VK_RETURN: sym = FcitxKey_Return; break;
++        case VK_ESCAPE: sym = FcitxKey_Escape; break;
++        case VK_TAB: sym = FcitxKey_Tab; break;
++        case VK_SPACE: sym = FcitxKey_space; break;
++        case VK_LEFT: sym = FcitxKey_Left; break;
++        case VK_RIGHT: sym = FcitxKey_Right; break;
++        case VK_UP: sym = FcitxKey_Up; break;
++        case VK_DOWN: sym = FcitxKey_Down; break;
++        case VK_HOME: sym = FcitxKey_Home; break;
++        case VK_END: sym = FcitxKey_End; break;
++        case VK_PRIOR: sym = FcitxKey_Page_Up; break;
++        case VK_NEXT: sym = FcitxKey_Page_Down; break;
++        case VK_DELETE: sym = FcitxKey_Delete; break;
++        case VK_APPS: sym = FcitxKey_Menu; break;
++        case VK_LSHIFT: sym = FcitxKey_Shift_L; break;
++        case VK_RSHIFT: sym = FcitxKey_Shift_R; break;
++        case VK_LCONTROL: sym = FcitxKey_Control_L; break;
++        case VK_RCONTROL: sym = FcitxKey_Control_R; break;
++        case VK_LMENU: sym = FcitxKey_Alt_L; break;
++        case VK_RMENU: sym = FcitxKey_Alt_R; break;
++        default:
++            if (vk >= '0' && vk <= '9') sym = static_cast<KeySym>(vk);
++            else if (vk >= 'A' && vk <= 'Z') sym = static_cast<KeySym>(vk + 32);
++            break;
++        }
++    }
++    return Key(sym, states);
++}
++
++} // namespace
++
++// ---- TsfInputContext 实现 ----
++TsfInputContext::TsfInputContext(InputContextManager &manager, Tsf *owner)
++    : InputContext(manager, "windows"), owner_(owner) {}
++
++void TsfInputContext::commitStringImpl(const std::string &text) {
++    owner_->onFcitxCommit(text);
++}
++
++// ---- EngineBridge 实现 ----
++void Tsf::EngineBridge::start(Tsf *self) {
++    owner = self;
++    // 诊断日志：宿主进程无 stderr，把 fcitx 日志重定向到文件
++    {
++        static FILE *logFile = nullptr;
++        if (!logFile) {
++            logFile = fopen("G:/WowType/fcitx5-inst/tsf-engine.log", "a");
++            if (logFile) {
++                fclose(stderr);
++                *stderr = *logFile;
++                setvbuf(stderr, nullptr, _IONBF, 0);
++            }
++        }
++    }
++    fcitx::Log::setLogRule("*=5,notimedate");
++    instance = std::make_unique<Instance>(0, nullptr);
++    auto &mgr = instance->addonManager();
++    mgr.registerDefaultLoader(nullptr);
++    instance->initialize();
++    dispatcher = std::make_unique<EventDispatcher>();
++    dispatcher->attach(&instance->eventLoop());
++    ic = new TsfInputContext(instance->inputContextManager(), owner);
++    ic->focusIn();
++    ready.store(true);
++    instance->eventLoop().exec();
++    ready.store(false);
++    ic->focusOut();
++    delete ic;
++    ic = nullptr;
++    dispatcher.reset();
++    instance.reset();
++}
++
++void Tsf::EngineBridge::stop() {
++    if (!instance) {
++        return;
++    }
++    instance->eventLoop().exit();
++    if (eventLoopThread.joinable()) {
++        eventLoopThread.join();
++    }
++}
++
++// ---- Tsf 方法 ----
++Tsf::Tsf() { DllAddRef(); }
++
++Tsf::~Tsf() {
++    destroyEngine();
++    DllRelease();
++}
++
++void Tsf::ensureEngine() {
++    if (bridge_ && bridge_->ready.load()) {
++        return;
++    }
++    destroyEngine();
++    setupFcitxEnv(fcitx::dllInstance);
++    bridge_ = std::make_unique<EngineBridge>();
++    bridge_->startAsync();
++}
++
++void Tsf::destroyEngine() {
++    if (!bridge_) {
++        return;
++    }
++    bridge_->stop();
++    bridge_.reset();
++}
++
++bool Tsf::engineReady() const { return bridge_ && bridge_->ready.load(); }
++
++void Tsf::onFcitxCommit(const std::string &utf8) {
++    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(),
++                                  nullptr, 0);
++    if (len <= 0) {
++        return;
++    }
++    std::wstring wide(len, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), wide.data(),
++                        len);
++    {
++        std::lock_guard<std::mutex> lk(commitMutex_);
++        pendingCommit_ += wide;
++    }
++    if (textEditSinkContext_) {
++        HRESULT hrSession;
++        textEditSinkContext_->RequestEditSession(clientId_, this,
++                                                 TF_ES_ASYNCDONTCARE |
++                                                     TF_ES_READWRITE,
++                                                 &hrSession);
++    }
++}
++
++bool Tsf::forwardKeyToFcitx(UINT vk, bool isRelease) {
++    if (!engineReady() || !bridge_ || !bridge_->ic) {
++        return false;
++    }
++    KeyStates mods = KeyState::NoState;
++    if (GetKeyState(VK_SHIFT) & 0x8000) mods |= KeyState::Shift;
++    if (GetKeyState(VK_CONTROL) & 0x8000) mods |= KeyState::Ctrl;
++    if (GetKeyState(VK_MENU) & 0x8000) mods |= KeyState::Alt;
++    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000)
++        mods |= KeyState::Super;
++    auto key = keyFromVk(vk, mods);
++
++    bool handled = false;
++    bridge_->runOnLoop([&]() {
++        KeyEvent event(bridge_->ic, key, isRelease);
++        handled = bridge_->ic->keyEvent(event);
++    });
++    return handled;
++}
++
++void Tsf::updateCursorRect(ITfContext *pContext) {
++    if (!engineReady() || !bridge_ || !bridge_->ic) {
++        return;
++    }
++    GUITHREADINFO info{};
++    info.cbSize = sizeof(info);
++    if (!GetGUIThreadInfo(0, &info) || info.hwndCaret == nullptr) {
++        return;
++    }
++    RECT rc = info.rcCaret;
++    POINT pt{rc.left, rc.bottom + 2};
++    if (!ClientToScreen(info.hwndCaret, &pt)) {
++        return;
++    }
++    fcitx::Rect rect(pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top);
++    bridge_->runOnLoop([&]() { bridge_->ic->setCursorRect(rect); });
++}
++
++} // namespace fcitx
+diff --git a/win32/tsf/fcitx_bridge.h b/win32/tsf/fcitx_bridge.h
+new file mode 100644
+index 0000000..40dc92c
+--- /dev/null
++++ b/win32/tsf/fcitx_bridge.h
+@@ -0,0 +1,73 @@
++/*
++ * WowType Windows 移植：TSF ↔ fcitx5 引擎桥的共享定义。
++ * 所有需要访问 bridge_ 成员的 .cpp 都 include 这个头。
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#pragma once
++
++#include <fcitx/inputcontext.h>
++#include <fcitx/inputcontextmanager.h>
++#include <fcitx/instance.h>
++#include <fcitx-utils/eventdispatcher.h>
++#include <fcitx-utils/event.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <thread>
++
++namespace fcitx {
++
++class Tsf;
++
++// TSF 专用的 InputContext：commit 直接进 TSF 上屏队列
++class TsfInputContext : public InputContext {
++  public:
++    TsfInputContext(InputContextManager &manager, Tsf *owner);
++    const char *frontend() const override { return "tsf"; }
++
++  protected:
++    void commitStringImpl(const std::string &text) override;
++    void updatePreeditImpl() override {}
++    void deleteSurroundingTextImpl(int offset, unsigned int size) override {}
++    void forwardKeyImpl(const ForwardKeyEvent &key) override {}
++
++  private:
++    Tsf *owner_;
++};
++
++struct Tsf::EngineBridge {
++    Tsf *owner = nullptr;
++    std::unique_ptr<Instance> instance;
++    std::unique_ptr<EventDispatcher> dispatcher;
++    std::thread eventLoopThread;
++    std::atomic<bool> ready{false};
++    TsfInputContext *ic = nullptr;
++
++    void start(Tsf *self);
++    void startAsync() {
++        eventLoopThread = std::thread(&EngineBridge::start, this, owner);
++    }
++    void stop();
++
++    // 在事件循环线程执行 f；阻塞等待完成。
++    template <typename F> void runOnLoop(F &&f) {
++        if (!ready.load() || !dispatcher) {
++            return;
++        }
++        bool done = false;
++        std::mutex m;
++        std::condition_variable cv;
++        dispatcher->schedule([&]() {
++            f();
++            std::lock_guard<std::mutex> lk(m);
++            done = true;
++            cv.notify_all();
++        });
++        std::unique_lock<std::mutex> lk(m);
++        cv.wait(lk, [&]() { return done; });
++    }
++};
++
++} // namespace fcitx
+diff --git a/win32/tsf/tsf.cpp b/win32/tsf/tsf.cpp
+index bd23084..8af41c0 100644
+--- a/win32/tsf/tsf.cpp
++++ b/win32/tsf/tsf.cpp
+@@ -1,13 +1,12 @@
+ #include "tsf.h"
++#include "fcitx_bridge.h"
+ #include <cassert>
+ 
+ extern void DllAddRef();
+ extern void DllRelease();
+ 
+ namespace fcitx {
+-Tsf::Tsf() { DllAddRef(); }
+ 
+-Tsf::~Tsf() { DllRelease(); }
+ 
+ // Windows also queries ITfDisplayAttributeCollectionProvider
+ // {3977526D-1A0A-435A-8D06-ECC9516B484F} which is internal and we simply
+diff --git a/win32/tsf/tsf.h b/win32/tsf/tsf.h
+index e7e2d45..43c82a3 100644
+--- a/win32/tsf/tsf.h
++++ b/win32/tsf/tsf.h
+@@ -1,9 +1,18 @@
+ #pragma once
+ 
+-#include <atlcomcli.h>
++#include "atlcomcli_min.h"
+ #include <msctf.h>
+ 
++#include <memory>
++#include <mutex>
++#include <string>
++
++using fcitx::CComPtr;
++using fcitx::CComQIPtr;
++
+ namespace fcitx {
++class InputContext;
++
+ class Tsf : public ITfTextInputProcessorEx,
+             public ITfThreadMgrEventSink,
+             public ITfTextEditSink,
+@@ -80,5 +89,24 @@ class Tsf : public ITfTextInputProcessorEx,
+     void uninitKeyEventSink();
+     BOOL processKey(WPARAM wParam, LPARAM lParam);
+     BOOL keyDownHandled_ = false;
++
++    // ---- fcitx5 引擎桥（fcitx_bridge.cpp 实现）----
++    struct EngineBridge;
++    std::unique_ptr<EngineBridge> bridge_;
++    // 引擎线程 → TSF UI 线程的上屏队列
++    std::mutex commitMutex_;
++    std::wstring pendingCommit_;
++
++    void ensureEngine();
++    void destroyEngine();
++    bool engineReady() const;
++    // 把按键发给 fcitx（阻塞等结果），返回 true 表示引擎吃掉了按键
++    bool forwardKeyToFcitx(UINT vk, bool isRelease);
++    // 引擎 commit 回调（在 fcitx 事件循环线程）：排队 + 请求编辑会话
++    void onFcitxCommit(const std::string &utf8);
++    // 取光标屏幕位置发给引擎（候选窗定位）
++    void updateCursorRect(ITfContext *pContext);
++    friend struct EngineBridge;
++    friend class TsfInputContext;
+ };
+ } // namespace fcitx
